@@ -15,6 +15,7 @@ A chaque execution :
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -61,14 +62,20 @@ log = logging.getLogger("econ-bot")
 # TELEGRAM
 # ----------------------------------------------------------------------
 
-def send_telegram_message(text: str) -> None:
+def send_telegram_message(text: str) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
+        return True
     except requests.RequestException as e:
-        log.error("Echec envoi Telegram : %s", e)
+        # On journalise le corps de la reponse Telegram (souvent tres parlant :
+        # "chat not found", "bot was blocked", "not enough rights to send text
+        # messages", etc.)
+        body = getattr(e.response, "text", "")
+        log.error("Echec envoi Telegram : %s | Reponse: %s", e, body[:300])
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -76,13 +83,51 @@ def send_telegram_message(text: str) -> None:
 # ----------------------------------------------------------------------
 
 def fetch_calendar() -> list:
-    try:
-        r = requests.get(CALENDAR_URL, timeout=15)
-        r.raise_for_status()
-        raw_events = r.json()
-    except requests.RequestException as e:
-        log.error("Echec telechargement calendrier : %s", e)
+    """Telecharge le calendrier, avec 3 tentatives en cas d'echec ou de
+    blocage (Forex Factory renvoie parfois une page HTML "Request Denied"
+    au lieu du JSON si trop de requetes viennent de la meme plage d'IP,
+    ce qui peut arriver avec les IP partagees de GitHub Actions)."""
+    raw_events = None
+    max_attempts = 3
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.get(
+                CALENDAR_URL,
+                timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; econ-bot/1.0)"},
+            )
+            content_type = r.headers.get("content-type", "")
+            preview = r.text[:150].strip()
+
+            looks_like_html = preview.lower().startswith(("<!doctype", "<html"))
+            if "json" not in content_type.lower() or looks_like_html:
+                log.warning(
+                    "Tentative %d/%d : reponse inattendue (probable blocage/limite "
+                    "de requetes). Status=%s Content-Type=%s Extrait=%r",
+                    attempt, max_attempts, r.status_code, content_type, preview,
+                )
+                if attempt < max_attempts:
+                    time.sleep(15)
+                    continue
+                return []
+
+            r.raise_for_status()
+            raw_events = r.json()
+            break
+
+        except requests.RequestException as e:
+            log.warning("Tentative %d/%d : echec telechargement calendrier : %s", attempt, max_attempts, e)
+            if attempt < max_attempts:
+                time.sleep(15)
+            else:
+                log.error("Abandon apres %d tentatives.", max_attempts)
+                return []
+
+    if raw_events is None:
         return []
+
+    log.info("Calendrier telecharge : %d evenement(s) au total (toutes devises/impacts confondus).", len(raw_events))
 
     events = []
     for e in raw_events:
@@ -167,10 +212,16 @@ def run_once():
             continue
         minutes_left = (event["time"] - now).total_seconds() / 60
         if 0 < minutes_left <= LEAD_TIME_MAX:
-            send_telegram_message(format_message(event, round(minutes_left)))
-            state[event["id"]] = event["time"].isoformat()
-            sent += 1
-            log.info("Alerte envoyee : %s (%s)", event["title"], event["country"])
+            ok = send_telegram_message(format_message(event, round(minutes_left)))
+            if ok:
+                state[event["id"]] = event["time"].isoformat()
+                sent += 1
+                log.info("Alerte envoyee : %s (%s)", event["title"], event["country"])
+            else:
+                log.error(
+                    "Alerte NON envoyee (sera retentee au prochain run) : %s (%s)",
+                    event["title"], event["country"],
+                )
 
     # Purge des vieilles entrees pour ne pas faire grossir le fichier indefiniment
     cutoff = now - timedelta(hours=STATE_RETENTION_HOURS)
