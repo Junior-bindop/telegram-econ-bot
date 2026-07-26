@@ -1,15 +1,15 @@
 """
-Bot Telegram - Alertes annonces economiques 3 etoiles (USD, EUR, GBP, JPY)
+Bot Telegram - Alertes annonces economiques 3 etoiles (personnalisable)
 Version "run-once", concue pour tourner via un cron GitHub Actions
 (le workflow relance ce script toutes les 5 minutes).
 
 A chaque execution :
-1. Telecharge le calendrier Forex Factory
-2. Filtre les evenements High impact (3 etoiles) sur USD/EUR/GBP/JPY
+1. Verifie les nouvelles commandes recues depuis Telegram (/prochaine, /devises, /aide)
+2. Telecharge le calendrier Forex Factory (evenements High impact / 3 etoiles)
 3. Envoie une alerte Telegram pour ceux qui commencent dans <= 10 minutes
-   et n'ont pas deja ete notifies
-4. Sauvegarde l'etat (evenements deja notifies) dans notified_events.json
-   -> ce fichier est ensuite commit dans le depot par le workflow GitHub
+   et n'ont pas deja ete notifies, pour les devises suivies
+4. Sauvegarde l'etat (evenements notifies + config) -> commit automatique
+   par le workflow GitHub
 """
 
 import json
@@ -29,27 +29,40 @@ from dateutil import parser as date_parser
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-CURRENCIES = {"USD", "EUR", "GBP", "JPY"}
+DEFAULT_CURRENCIES = ["USD", "EUR", "GBP", "JPY"]
 IMPACT_FILTER = {"High"}          # 3 etoiles = "High" chez Forex Factory
 
 FLAGS = {
-    "USD": "\U0001F1FA\U0001F1F8",   # 🇺🇸
-    "EUR": "\U0001F1EA\U0001F1FA",   # 🇪🇺
-    "GBP": "\U0001F1EC\U0001F1E7",   # 🇬🇧
-    "JPY": "\U0001F1EF\U0001F1F5",   # 🇯🇵
+    "USD": "\U0001F1FA\U0001F1F8",
+    "EUR": "\U0001F1EA\U0001F1FA",
+    "GBP": "\U0001F1EC\U0001F1E7",
+    "JPY": "\U0001F1EF\U0001F1F5",
+    "AUD": "\U0001F1E6\U0001F1FA",
+    "CAD": "\U0001F1E8\U0001F1E6",
+    "CHF": "\U0001F1E8\U0001F1ED",
+    "CNY": "\U0001F1E8\U0001F1F3",
+    "NZD": "\U0001F1F3\U0001F1FF",
 }
 
 # GitHub Actions ne garantit pas une precision a la minute pres pour les
-# taches planifiees (delais possibles en cas de forte charge). On alerte
-# donc des qu'il reste <= 10 min avant l'annonce (plutot que d'exiger
-# precisement 5-10 min), pour ne jamais rater completement une alerte.
+# taches planifiees. On alerte donc des qu'il reste <= 10 min avant
+# l'annonce (plutot que d'exiger precisement 5-10 min).
 LEAD_TIME_MAX = 10
 
 LOCAL_TZ_OFFSET_HOURS = 1   # Cameroun (UTC+1, pas de changement d'heure)
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 STATE_FILE = Path(__file__).parent / "notified_events.json"
-STATE_RETENTION_HOURS = 24  # purge les entrees plus vieilles que ca
+CONFIG_FILE = Path(__file__).parent / "bot_config.json"
+STATE_RETENTION_HOURS = 24
+
+COMMANDS_HELP = (
+    "\U0001F4CB <b>Commandes disponibles</b>\n"
+    "/prochaine - la prochaine annonce 3\u2b50 a venir\n"
+    "/devises - voir les devises actuellement suivies\n"
+    "/devises USD,EUR,GBP,JPY - changer les devises suivies\n"
+    "/aide - ce message"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,20 +75,32 @@ log = logging.getLogger("econ-bot")
 # TELEGRAM
 # ----------------------------------------------------------------------
 
-def send_telegram_message(text: str) -> bool:
+def send_telegram_message(text: str, chat_id: str = None) -> bool:
+    target = chat_id or CHAT_ID
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": target, "text": text, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
         return True
     except requests.RequestException as e:
-        # On journalise le corps de la reponse Telegram (souvent tres parlant :
-        # "chat not found", "bot was blocked", "not enough rights to send text
-        # messages", etc.)
         body = getattr(e.response, "text", "")
         log.error("Echec envoi Telegram : %s | Reponse: %s", e, body[:300])
         return False
+
+
+def get_telegram_updates(offset) -> list:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json().get("result", [])
+    except requests.RequestException as e:
+        log.error("Echec recuperation des messages Telegram : %s", e)
+        return []
 
 
 # ----------------------------------------------------------------------
@@ -83,10 +108,10 @@ def send_telegram_message(text: str) -> bool:
 # ----------------------------------------------------------------------
 
 def fetch_calendar() -> list:
-    """Telecharge le calendrier, avec 3 tentatives en cas d'echec ou de
-    blocage (Forex Factory renvoie parfois une page HTML "Request Denied"
-    au lieu du JSON si trop de requetes viennent de la meme plage d'IP,
-    ce qui peut arriver avec les IP partagees de GitHub Actions)."""
+    """Telecharge le calendrier et ne garde que les evenements High impact
+    (3 etoiles), toutes devises confondues. Le filtrage par devise se fait
+    ensuite separement (config['currencies']), pour pouvoir le changer
+    depuis Telegram sans toucher au code."""
     raw_events = None
     max_attempts = 3
 
@@ -99,23 +124,20 @@ def fetch_calendar() -> list:
             )
             content_type = r.headers.get("content-type", "")
             preview = r.text[:150].strip()
-
             looks_like_html = preview.lower().startswith(("<!doctype", "<html"))
             if "json" not in content_type.lower() or looks_like_html:
                 log.warning(
-                    "Tentative %d/%d : reponse inattendue (probable blocage/limite "
-                    "de requetes). Status=%s Content-Type=%s Extrait=%r",
+                    "Tentative %d/%d : reponse inattendue (probable blocage/limite). "
+                    "Status=%s Content-Type=%s Extrait=%r",
                     attempt, max_attempts, r.status_code, content_type, preview,
                 )
                 if attempt < max_attempts:
                     time.sleep(15)
                     continue
                 return []
-
             r.raise_for_status()
             raw_events = r.json()
             break
-
         except requests.RequestException as e:
             log.warning("Tentative %d/%d : echec telechargement calendrier : %s", attempt, max_attempts, e)
             if attempt < max_attempts:
@@ -127,13 +149,11 @@ def fetch_calendar() -> list:
     if raw_events is None:
         return []
 
-    log.info("Calendrier telecharge : %d evenement(s) au total (toutes devises/impacts confondus).", len(raw_events))
+    log.info("Calendrier telecharge : %d evenement(s) au total.", len(raw_events))
 
     events = []
     for e in raw_events:
         try:
-            if e.get("country") not in CURRENCIES:
-                continue
             if e.get("impact") not in IMPACT_FILTER:
                 continue
             event_time = date_parser.parse(e["date"])
@@ -149,28 +169,121 @@ def fetch_calendar() -> list:
             })
         except Exception as ex:
             log.warning("Evenement ignore (parsing) : %s", ex)
+
+    log.info("%d evenement(s) 3 etoiles au total (toutes devises).", len(events))
     return events
 
 
 # ----------------------------------------------------------------------
-# ETAT (evenements deja notifies)
+# ETAT ET CONFIGURATION (persistes via commit git)
 # ----------------------------------------------------------------------
 
-def load_state() -> dict:
-    if STATE_FILE.exists():
+def load_json(path: Path, default):
+    if path.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            return json.loads(path.read_text())
         except Exception:
-            return {}
-    return {}
+            return default
+    return default
+
+
+def save_json(path: Path, data) -> None:
+    path.write_text(json.dumps(data, indent=2))
+
+
+def load_state() -> dict:
+    return load_json(STATE_FILE, {})
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    save_json(STATE_FILE, state)
+
+
+def load_config() -> dict:
+    config = load_json(CONFIG_FILE, {})
+    config.setdefault("currencies", list(DEFAULT_CURRENCIES))
+    config.setdefault("last_update_id", None)
+    return config
+
+
+def save_config(config: dict) -> None:
+    save_json(CONFIG_FILE, config)
 
 
 # ----------------------------------------------------------------------
-# LOGIQUE PRINCIPALE
+# COMMANDES TELEGRAM
+# ----------------------------------------------------------------------
+
+def build_next_event_reply(config: dict, events: list, now: datetime) -> str:
+    matching = [
+        e for e in events
+        if e["country"] in config["currencies"] and e["time"] > now
+    ]
+    if not matching:
+        return "Aucune annonce 3\u2b50 a venir cette semaine pour les devises suivies."
+    matching.sort(key=lambda e: e["time"])
+    nxt = matching[0]
+    delta_min = round((nxt["time"] - now).total_seconds() / 60)
+    local_time = nxt["time"] + timedelta(hours=LOCAL_TZ_OFFSET_HOURS)
+    flag = FLAGS.get(nxt["country"], "")
+    return (
+        f"\U0001F4C5 <b>Prochaine annonce 3\u2b50</b>\n"
+        f"Sujet : {nxt['title']} {flag}\n"
+        f"Heure : {local_time.strftime('%a %d/%m %H:%M')} (GMT+1)\n"
+        f"Dans environ {delta_min} min"
+    )
+
+
+def handle_commands(config: dict, events: list, now: datetime) -> None:
+    updates = get_telegram_updates(config.get("last_update_id"))
+    log.info("Commandes : %d nouveau(x) message(s) recu(s) via getUpdates.", len(updates))
+
+    for update in updates:
+        # On avance l'offset dans tous les cas, pour ne jamais retraiter
+        # un vieux message (meme ignore).
+        config["last_update_id"] = update["update_id"] + 1
+
+        msg = update.get("message") or update.get("channel_post")
+        if not msg or "text" not in msg:
+            log.info("Update %s ignore (pas de texte / type non gere).", update.get("update_id"))
+            continue
+
+        chat_id = msg["chat"]["id"]
+        text = msg["text"].strip()
+        log.info("Message recu : chat_id=%s (attendu=%s) texte=%r", chat_id, CHAT_ID, text)
+
+        if str(chat_id) != str(CHAT_ID):
+            log.info("Message ignore : provient d'un autre chat que celui configure.")
+            continue
+
+        if not text:
+            continue
+        command = text.split()[0].split("@")[0].lower()
+
+        if command == "/prochaine":
+            reply = build_next_event_reply(config, events, now)
+        elif command == "/devises":
+            parts = text.split(maxsplit=1)
+            if len(parts) == 1:
+                reply = "Devises suivies actuellement : " + ", ".join(config["currencies"])
+            else:
+                new_currencies = sorted({c.strip().upper() for c in parts[1].split(",") if c.strip()})
+                if not new_currencies:
+                    reply = "Format invalide. Exemple : /devises USD,EUR,GBP,JPY"
+                else:
+                    config["currencies"] = new_currencies
+                    reply = "\u2705 Devises mises a jour : " + ", ".join(new_currencies)
+        elif command in ("/aide", "/start", "/help"):
+            reply = COMMANDS_HELP
+        else:
+            continue  # commande inconnue, on ignore silencieusement
+
+        send_telegram_message(reply, chat_id=chat_id)
+        log.info("Commande traitee : %s", command)
+
+
+# ----------------------------------------------------------------------
+# ALERTES
 # ----------------------------------------------------------------------
 
 def format_message(event: dict, minutes_left: int) -> str:
@@ -203,11 +316,15 @@ def run_once():
 
     now = datetime.now(timezone.utc)
     state = load_state()
+    config = load_config()
     events = fetch_calendar()
-    log.info("%d evenement(s) 3 etoiles dans le calendrier.", len(events))
+
+    handle_commands(config, events, now)
 
     sent = 0
     for event in events:
+        if event["country"] not in config["currencies"]:
+            continue
         if event["id"] in state:
             continue
         minutes_left = (event["time"] - now).total_seconds() / 60
@@ -223,7 +340,6 @@ def run_once():
                     event["title"], event["country"],
                 )
 
-    # Purge des vieilles entrees pour ne pas faire grossir le fichier indefiniment
     cutoff = now - timedelta(hours=STATE_RETENTION_HOURS)
     state = {
         eid: ts for eid, ts in state.items()
@@ -231,9 +347,10 @@ def run_once():
     }
 
     save_state(state)
+    save_config(config)
     log.info(
-        "%d alerte(s) envoyee(s). Etat sauvegarde (%d evenement(s) suivis).",
-        sent, len(state),
+        "%d alerte(s) envoyee(s). Devises suivies : %s. Etat sauvegarde (%d evenement(s) suivis).",
+        sent, ", ".join(config["currencies"]), len(state),
     )
 
 
