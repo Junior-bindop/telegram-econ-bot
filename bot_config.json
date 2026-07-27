@@ -1,4 +1,9 @@
 {
-  "currencies": ["USD", "EUR", "GBP", "JPY"],
-  "last_update_id": null
+  "currencies": [
+    "USD",
+    "EUR",
+    "GBP",
+    "JPY"
+  ],
+  "last_update_id": 582842822
 }
