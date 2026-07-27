@@ -1,20 +1,25 @@
 """
 Bot Telegram - Alertes annonces economiques 3 etoiles (personnalisable)
-Version "run-once", concue pour tourner via un cron GitHub Actions
-(le workflow relance ce script toutes les 5 minutes).
+Version "continue" avec long polling : un run reste actif plusieurs heures
+(jusqu'a la limite GitHub de 6h) et repond aux commandes quasi instantanement
+via le long polling Telegram, au lieu de dependre du cron GitHub Actions qui
+peut deriver de plusieurs heures. Juste avant sa limite de temps, le run
+relance automatiquement un nouveau run pour prendre le relais (chaine
+continue, invisible pour l'utilisateur).
 
-A chaque execution :
-1. Verifie les nouvelles commandes recues depuis Telegram (/prochaine, /devises, /aide)
-2. Telecharge le calendrier Forex Factory (evenements High impact / 3 etoiles)
-3. Envoie une alerte Telegram pour ceux qui commencent dans <= 10 minutes
-   et n'ont pas deja ete notifies, pour les devises suivies
-4. Sauvegarde l'etat (evenements notifies + config) -> commit automatique
-   par le workflow GitHub
+Le calendrier est telecharge UNE SEULE FOIS au demarrage du run et garde en
+memoire toute sa duree : les commandes (/prochaine, /devises) repondent
+instantanement a partir de cette memoire, sans nouvelle requete au calendrier.
+
+Chaque evenement 3 etoiles declenche DEUX alertes independantes :
+- une environ 5 minutes avant le debut
+- une au moment meme du debut
 """
 
 import json
 import logging
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +33,9 @@ from dateutil import parser as date_parser
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")  # fourni automatiquement par Actions
+WORKFLOW_FILE = "econ-bot.yml"
 
 DEFAULT_CURRENCIES = ["USD", "EUR", "GBP", "JPY"]
 IMPACT_FILTER = {"High"}          # 3 etoiles = "High" chez Forex Factory
@@ -44,17 +52,17 @@ FLAGS = {
     "NZD": "\U0001F1F3\U0001F1FF",
 }
 
-# GitHub Actions ne garantit pas une precision a la minute pres pour les
-# taches planifiees. On alerte donc des qu'il reste <= 10 min avant
-# l'annonce (plutot que d'exiger precisement 5-10 min).
-LEAD_TIME_MAX = 10
-
-LOCAL_TZ_OFFSET_HOURS = 1   # Cameroun (UTC+1, pas de changement d'heure)
+WARNING_LEAD_MINUTES = 5     # alerte "bientot"
+FINAL_GRACE_MINUTES = 5      # alerte "maintenant" (tolerance apres le debut)
+LOCAL_TZ_OFFSET_HOURS = 1    # Cameroun (UTC+1, pas de changement d'heure)
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 STATE_FILE = Path(__file__).parent / "notified_events.json"
 CONFIG_FILE = Path(__file__).parent / "bot_config.json"
 STATE_RETENTION_HOURS = 24
+
+POLL_TIMEOUT_SECONDS = 25          # duree du long polling Telegram
+MAX_RUNTIME_SECONDS = int(5.75 * 3600)   # ~5h45, sous la limite GitHub de 6h
 
 COMMANDS_HELP = (
     "\U0001F4CB <b>Commandes disponibles</b>\n"
@@ -90,12 +98,15 @@ def send_telegram_message(text: str, chat_id: str = None) -> bool:
 
 
 def get_telegram_updates(offset) -> list:
+    """Long polling : Telegram garde la connexion ouverte et repond des
+    qu'un message arrive (quasi instantane), ou apres POLL_TIMEOUT_SECONDS
+    si rien ne se passe."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 0}
+    params = {"timeout": POLL_TIMEOUT_SECONDS}
     if offset is not None:
         params["offset"] = offset
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=POLL_TIMEOUT_SECONDS + 10)
         r.raise_for_status()
         return r.json().get("result", [])
     except requests.RequestException as e:
@@ -108,10 +119,9 @@ def get_telegram_updates(offset) -> list:
 # ----------------------------------------------------------------------
 
 def fetch_calendar() -> list:
-    """Telecharge le calendrier et ne garde que les evenements High impact
-    (3 etoiles), toutes devises confondues. Le filtrage par devise se fait
-    ensuite separement (config['currencies']), pour pouvoir le changer
-    depuis Telegram sans toucher au code."""
+    """Telecharge le calendrier une seule fois par run et ne garde que les
+    evenements High impact (3 etoiles), toutes devises confondues. Le
+    filtrage par devise se fait ensuite separement (config['currencies'])."""
     raw_events = None
     max_attempts = 3
 
@@ -149,8 +159,6 @@ def fetch_calendar() -> list:
     if raw_events is None:
         return []
 
-    log.info("Calendrier telecharge : %d evenement(s) au total.", len(raw_events))
-
     events = []
     for e in raw_events:
         try:
@@ -170,12 +178,12 @@ def fetch_calendar() -> list:
         except Exception as ex:
             log.warning("Evenement ignore (parsing) : %s", ex)
 
-    log.info("%d evenement(s) 3 etoiles au total (toutes devises).", len(events))
+    log.info("Calendrier charge en memoire : %d evenement(s) 3 etoiles (toutes devises).", len(events))
     return events
 
 
 # ----------------------------------------------------------------------
-# ETAT ET CONFIGURATION (persistes via commit git)
+# ETAT ET CONFIGURATION (persistes via commit git incremental)
 # ----------------------------------------------------------------------
 
 def load_json(path: Path, default):
@@ -210,6 +218,42 @@ def save_config(config: dict) -> None:
     save_json(CONFIG_FILE, config)
 
 
+def git_commit_and_push(message: str) -> None:
+    repo_dir = str(Path(__file__).parent)
+    try:
+        subprocess.run(
+            ["git", "add", str(STATE_FILE), str(CONFIG_FILE)],
+            check=True, cwd=repo_dir,
+        )
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=repo_dir)
+        if diff.returncode == 0:
+            return  # rien de nouveau a committer
+        subprocess.run(["git", "commit", "-m", message], check=True, cwd=repo_dir)
+        subprocess.run(["git", "push"], check=True, cwd=repo_dir)
+        log.info("Etat sauvegarde sur GitHub : %s", message)
+    except subprocess.CalledProcessError as e:
+        log.error("Echec git commit/push : %s", e)
+
+
+def trigger_next_run() -> None:
+    """Relance un nouveau run via l'API GitHub pour prendre le relais avant
+    que le run actuel n'atteigne sa limite de temps (~6h max GitHub)."""
+    if not GITHUB_REPOSITORY or not GITHUB_TOKEN:
+        log.warning("Relai impossible (GITHUB_REPOSITORY/GITHUB_TOKEN manquant).")
+        return
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/workflows/{WORKFLOW_FILE}/dispatches"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        r = requests.post(url, headers=headers, json={"ref": "main"}, timeout=10)
+        r.raise_for_status()
+        log.info("Relai reussi : un nouveau run vient d'etre declenche.")
+    except requests.RequestException as e:
+        log.error("Echec du relai vers le prochain run : %s", e)
+
+
 # ----------------------------------------------------------------------
 # COMMANDES TELEGRAM
 # ----------------------------------------------------------------------
@@ -235,17 +279,18 @@ def build_next_event_reply(config: dict, events: list, now: datetime) -> str:
 
 
 def handle_commands(config: dict, events: list, now: datetime) -> None:
+    """Bloque jusqu'a POLL_TIMEOUT_SECONDS, ou repond des qu'un message
+    arrive (long polling). Ne touche a rien si aucun message recu."""
     updates = get_telegram_updates(config.get("last_update_id"))
+    if not updates:
+        return
     log.info("Commandes : %d nouveau(x) message(s) recu(s) via getUpdates.", len(updates))
 
     for update in updates:
-        # On avance l'offset dans tous les cas, pour ne jamais retraiter
-        # un vieux message (meme ignore).
         config["last_update_id"] = update["update_id"] + 1
 
         msg = update.get("message") or update.get("channel_post")
         if not msg or "text" not in msg:
-            log.info("Update %s ignore (pas de texte / type non gere).", update.get("update_id"))
             continue
 
         chat_id = msg["chat"]["id"]
@@ -255,9 +300,9 @@ def handle_commands(config: dict, events: list, now: datetime) -> None:
         if str(chat_id) != str(CHAT_ID):
             log.info("Message ignore : provient d'un autre chat que celui configure.")
             continue
-
         if not text:
             continue
+
         command = text.split()[0].split("@")[0].lower()
 
         if command == "/prochaine":
@@ -276,7 +321,7 @@ def handle_commands(config: dict, events: list, now: datetime) -> None:
         elif command in ("/aide", "/start", "/help"):
             reply = COMMANDS_HELP
         else:
-            continue  # commande inconnue, on ignore silencieusement
+            continue
 
         send_telegram_message(reply, chat_id=chat_id)
         log.info("Commande traitee : %s", command)
@@ -286,7 +331,7 @@ def handle_commands(config: dict, events: list, now: datetime) -> None:
 # ALERTES
 # ----------------------------------------------------------------------
 
-def format_message(event: dict, minutes_left: int) -> str:
+def format_message(event: dict, mode: str, minutes_left: int = None) -> str:
     local_time = event["time"] + timedelta(hours=LOCAL_TZ_OFFSET_HOURS)
     flag = FLAGS.get(event["country"], "")
 
@@ -299,60 +344,89 @@ def format_message(event: dict, minutes_left: int) -> str:
         details_lines.append("Pas de donnees previsionnelles disponibles")
     details = "\n".join(details_lines)
 
+    if mode == "warning":
+        header = "\U0001F4E2 <b>ANNONCE ECONOMIQUE</b> \U0001F6A8"
+        timing = f"Heure : {local_time.strftime('%H:%M')} (GMT+1) \u2014 dans ~{minutes_left} min"
+    else:
+        header = "\U0001F534 <b>ANNONCE EN COURS MAINTENANT</b>"
+        timing = f"Heure : {local_time.strftime('%H:%M')} (GMT+1)"
+
     return (
-        f"\U0001F4E2 <b>ANNONCE ECONOMIQUE</b> \U0001F6A8\n"
+        f"{header}\n"
         f"Sujet : {event['title']} {flag}\n"
         f"Importance : \U0001F31F\U0001F31F\U0001F31F\n"
         f"Details :\n{details}\n"
-        f"Heure : {local_time.strftime('%H:%M')} (GMT+1) \u2014 dans ~{minutes_left} min"
+        f"{timing}"
     )
 
 
-def run_once():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit(
-            "BOT_TOKEN et CHAT_ID doivent etre definis (secrets GitHub Actions)."
-        )
+# ----------------------------------------------------------------------
+# BOUCLE PRINCIPALE (continue, long polling, relai avant expiration)
+# ----------------------------------------------------------------------
 
-    now = datetime.now(timezone.utc)
+def run_forever():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit("BOT_TOKEN et CHAT_ID doivent etre definis (secrets GitHub Actions).")
+
+    start = time.monotonic()
     state = load_state()
     config = load_config()
-    events = fetch_calendar()
+    events = fetch_calendar()   # une seule fois, garde en memoire tout le run
 
-    handle_commands(config, events, now)
+    log.info(
+        "Demarrage du mode continu. %d evenement(s) 3 etoiles charges. Devises : %s.",
+        len(events), ", ".join(config["currencies"]),
+    )
 
-    sent = 0
-    for event in events:
-        if event["country"] not in config["currencies"]:
-            continue
-        if event["id"] in state:
-            continue
-        minutes_left = (event["time"] - now).total_seconds() / 60
-        if 0 < minutes_left <= LEAD_TIME_MAX:
-            ok = send_telegram_message(format_message(event, round(minutes_left)))
-            if ok:
-                state[event["id"]] = event["time"].isoformat()
-                sent += 1
-                log.info("Alerte envoyee : %s (%s)", event["title"], event["country"])
-            else:
-                log.error(
-                    "Alerte NON envoyee (sera retentee au prochain run) : %s (%s)",
-                    event["title"], event["country"],
-                )
+    while time.monotonic() - start < MAX_RUNTIME_SECONDS:
+        now = datetime.now(timezone.utc)
 
-    cutoff = now - timedelta(hours=STATE_RETENTION_HOURS)
-    state = {
-        eid: ts for eid, ts in state.items()
-        if date_parser.parse(ts) > cutoff
-    }
+        # --- Commandes (long polling, quasi instantane) ---
+        poll_start = time.monotonic()
+        config_before = json.dumps(config, sort_keys=True)
+        handle_commands(config, events, now)
+        if json.dumps(config, sort_keys=True) != config_before:
+            save_config(config)
+            git_commit_and_push("Update bot config (commande Telegram)")
 
+        # Securite anti-martelage si getUpdates a echoue tres vite (erreur reseau)
+        if time.monotonic() - poll_start < 1:
+            time.sleep(3)
+
+        # --- Alertes : "bientot" (5 min avant) + "maintenant" (au debut) ---
+        sent_any = False
+        for event in events:
+            if event["country"] not in config["currencies"]:
+                continue
+            minutes_left = (event["time"] - now).total_seconds() / 60
+
+            warn_key = event["id"] + ":warning"
+            if warn_key not in state and 0 < minutes_left <= WARNING_LEAD_MINUTES:
+                if send_telegram_message(format_message(event, "warning", round(minutes_left))):
+                    state[warn_key] = event["time"].isoformat()
+                    sent_any = True
+                    log.info("Alerte 'bientot' envoyee : %s (%s)", event["title"], event["country"])
+
+            final_key = event["id"] + ":final"
+            if final_key not in state and -FINAL_GRACE_MINUTES <= minutes_left <= 0:
+                if send_telegram_message(format_message(event, "final")):
+                    state[final_key] = event["time"].isoformat()
+                    sent_any = True
+                    log.info("Alerte 'maintenant' envoyee : %s (%s)", event["title"], event["country"])
+
+        if sent_any:
+            cutoff = now - timedelta(hours=STATE_RETENTION_HOURS)
+            state = {eid: ts for eid, ts in state.items() if date_parser.parse(ts) > cutoff}
+            save_state(state)
+            git_commit_and_push("Update notified events")
+
+    log.info("Limite de temps interne atteinte (~%d min). Relai vers un nouveau run.",
+              int(MAX_RUNTIME_SECONDS / 60))
     save_state(state)
     save_config(config)
-    log.info(
-        "%d alerte(s) envoyee(s). Devises suivies : %s. Etat sauvegarde (%d evenement(s) suivis).",
-        sent, ", ".join(config["currencies"]), len(state),
-    )
+    git_commit_and_push("Etat final avant relai")
+    trigger_next_run()
 
 
 if __name__ == "__main__":
-    run_once()
+    run_forever()
