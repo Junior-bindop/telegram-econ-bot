@@ -55,6 +55,7 @@ FLAGS = {
 WARNING_LEAD_MINUTES = 5     # alerte "bientot"
 FINAL_GRACE_MINUTES = 5      # alerte "maintenant" (tolerance apres le debut)
 LOCAL_TZ_OFFSET_HOURS = 1    # Cameroun (UTC+1, pas de changement d'heure)
+LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET_HOURS))
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 STATE_FILE = Path(__file__).parent / "notified_events.json"
@@ -268,7 +269,7 @@ def build_next_event_reply(config: dict, events: list, now: datetime) -> str:
     matching.sort(key=lambda e: e["time"])
     nxt = matching[0]
     delta_min = round((nxt["time"] - now).total_seconds() / 60)
-    local_time = nxt["time"] + timedelta(hours=LOCAL_TZ_OFFSET_HOURS)
+    local_time = nxt["time"].astimezone(LOCAL_TZ)
     flag = FLAGS.get(nxt["country"], "")
     return (
         f"\U0001F4C5 <b>Prochaine annonce 3\u2b50</b>\n"
@@ -332,7 +333,7 @@ def handle_commands(config: dict, events: list, now: datetime) -> None:
 # ----------------------------------------------------------------------
 
 def format_message(event: dict, mode: str, minutes_left: int = None) -> str:
-    local_time = event["time"] + timedelta(hours=LOCAL_TZ_OFFSET_HOURS)
+    local_time = event["time"].astimezone(LOCAL_TZ)
     flag = FLAGS.get(event["country"], "")
 
     details_lines = []
@@ -378,47 +379,68 @@ def run_forever():
         len(events), ", ".join(config["currencies"]),
     )
 
+    last_heartbeat = time.monotonic()
+
     while time.monotonic() - start < MAX_RUNTIME_SECONDS:
-        now = datetime.now(timezone.utc)
+        try:
+            now = datetime.now(timezone.utc)
 
-        # --- Commandes (long polling, quasi instantane) ---
-        poll_start = time.monotonic()
-        config_before = json.dumps(config, sort_keys=True)
-        handle_commands(config, events, now)
-        if json.dumps(config, sort_keys=True) != config_before:
-            save_config(config)
-            git_commit_and_push("Update bot config (commande Telegram)")
+            if time.monotonic() - last_heartbeat > 300:  # toutes les ~5 min
+                log.info(
+                    "Toujours actif depuis %d min. En attente de commandes/annonces...",
+                    int((time.monotonic() - start) / 60),
+                )
+                last_heartbeat = time.monotonic()
 
-        # Securite anti-martelage si getUpdates a echoue tres vite (erreur reseau)
-        if time.monotonic() - poll_start < 1:
-            time.sleep(3)
+            # --- Commandes (long polling, quasi instantane) ---
+            poll_start = time.monotonic()
+            config_before = json.dumps(config, sort_keys=True)
+            handle_commands(config, events, now)
+            if json.dumps(config, sort_keys=True) != config_before:
+                save_config(config)
+                git_commit_and_push("Update bot config (commande Telegram)")
 
-        # --- Alertes : "bientot" (5 min avant) + "maintenant" (au debut) ---
-        sent_any = False
-        for event in events:
-            if event["country"] not in config["currencies"]:
-                continue
-            minutes_left = (event["time"] - now).total_seconds() / 60
+            # Securite anti-martelage si getUpdates a echoue tres vite (erreur reseau)
+            if time.monotonic() - poll_start < 1:
+                time.sleep(3)
 
-            warn_key = event["id"] + ":warning"
-            if warn_key not in state and 0 < minutes_left <= WARNING_LEAD_MINUTES:
-                if send_telegram_message(format_message(event, "warning", round(minutes_left))):
-                    state[warn_key] = event["time"].isoformat()
-                    sent_any = True
-                    log.info("Alerte 'bientot' envoyee : %s (%s)", event["title"], event["country"])
+            # --- Alertes : "bientot" (5 min avant) + "maintenant" (au debut) ---
+            for event in events:
+                if event["country"] not in config["currencies"]:
+                    continue
+                minutes_left = (event["time"] - now).total_seconds() / 60
 
-            final_key = event["id"] + ":final"
-            if final_key not in state and -FINAL_GRACE_MINUTES <= minutes_left <= 0:
-                if send_telegram_message(format_message(event, "final")):
-                    state[final_key] = event["time"].isoformat()
-                    sent_any = True
-                    log.info("Alerte 'maintenant' envoyee : %s (%s)", event["title"], event["country"])
+                warn_key = event["id"] + ":warning"
+                if warn_key not in state and 0 < minutes_left <= WARNING_LEAD_MINUTES:
+                    if send_telegram_message(format_message(event, "warning", round(minutes_left))):
+                        state[warn_key] = event["time"].isoformat()
+                        save_state(state)
+                        git_commit_and_push("Update notified events (bientot)")
+                        log.info("Alerte 'bientot' envoyee : %s (%s)", event["title"], event["country"])
 
-        if sent_any:
-            cutoff = now - timedelta(hours=STATE_RETENTION_HOURS)
-            state = {eid: ts for eid, ts in state.items() if date_parser.parse(ts) > cutoff}
-            save_state(state)
-            git_commit_and_push("Update notified events")
+                final_key = event["id"] + ":final"
+                if final_key not in state and -FINAL_GRACE_MINUTES <= minutes_left <= 0:
+                    if send_telegram_message(format_message(event, "final")):
+                        state[final_key] = event["time"].isoformat()
+                        save_state(state)
+                        git_commit_and_push("Update notified events (maintenant)")
+                        log.info("Alerte 'maintenant' envoyee : %s (%s)", event["title"], event["country"])
+
+            # Purge occasionnelle des vieilles entrees (pas besoin d'un commit dedie)
+            if int(time.monotonic() - start) % 600 < 2:  # environ toutes les 10 min
+                cutoff = now - timedelta(hours=STATE_RETENTION_HOURS)
+                pruned = {eid: ts for eid, ts in state.items() if date_parser.parse(ts) > cutoff}
+                if len(pruned) != len(state):
+                    state = pruned
+                    save_state(state)
+                    git_commit_and_push("Purge des vieux evenements")
+
+        except Exception as ex:
+            # Une erreur isolee (reseau, parsing, etc.) ne doit jamais faire
+            # planter tout le run de plusieurs heures : on journalise et on
+            # continue a la prochaine iteration.
+            log.error("Erreur inattendue dans la boucle (ignoree, on continue) : %s", ex)
+            time.sleep(5)
 
     log.info("Limite de temps interne atteinte (~%d min). Relai vers un nouveau run.",
               int(MAX_RUNTIME_SECONDS / 60))
@@ -429,4 +451,12 @@ def run_forever():
 
 
 if __name__ == "__main__":
-    run_forever()
+    try:
+        run_forever()
+    except Exception as fatal_error:
+        # Filet de securite ultime : meme en cas de plantage totalement
+        # imprevu, on tente de relancer le prochain run pour ne jamais
+        # casser la chaine de relais.
+        log.error("Erreur fatale imprevue : %s", fatal_error)
+        trigger_next_run()
+        raise
