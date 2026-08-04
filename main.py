@@ -63,7 +63,7 @@ CONFIG_FILE = Path(__file__).parent / "bot_config.json"
 STATE_RETENTION_HOURS = 24
 
 POLL_TIMEOUT_SECONDS = 25          # duree du long polling Telegram
-MAX_RUNTIME_SECONDS = int(5.75 * 3600)   # ~5h45, sous la limite GitHub de 6h
+MAX_RUNTIME_SECONDS = int(5.5 * 3600)    # ~5h30, marge de securite confortable sous la limite GitHub de 6h
 
 COMMANDS_HELP = (
     "\U0001F4CB <b>Commandes disponibles</b>\n"
@@ -444,9 +444,12 @@ def run_forever():
 
     log.info("Limite de temps interne atteinte (~%d min). Relai vers un nouveau run.",
               int(MAX_RUNTIME_SECONDS / 60))
-    save_state(state)
-    save_config(config)
-    git_commit_and_push("Etat final avant relai")
+    try:
+        save_state(state)
+        save_config(config)
+        git_commit_and_push("Etat final avant relai")
+    except Exception as ex:
+        log.error("Erreur lors de la sauvegarde finale (ignoree, relais quand meme) : %s", ex)
     trigger_next_run()
 
 
@@ -454,9 +457,10 @@ if __name__ == "__main__":
     try:
         run_forever()
     except Exception as fatal_error:
-        # Filet de securite ultime : meme en cas de plantage totalement
-        # imprevu, on tente de relancer le prochain run pour ne jamais
-        # casser la chaine de relais.
-        log.error("Erreur fatale imprevue : %s", fatal_error)
+        # Meme en cas de plantage totalement imprevu, on tente de relancer
+        # le prochain run pour ne jamais casser la chaine de relais - et on
+        # NE relance PAS l'exception : tant que le relais a fonctionne, ce
+        # n'est pas un vrai echec pour GitHub (evite le spam d'emails
+        # "Run failed" alors que le bot continue de fonctionner normalement).
+        log.error("Erreur fatale imprevue (geree, relais assure) : %s", fatal_error)
         trigger_next_run()
-        raise
